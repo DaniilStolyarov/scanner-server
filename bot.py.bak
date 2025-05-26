@@ -1,0 +1,135 @@
+# scanner_bot.py  – python-telegram-bot 22  +  websockets 11
+import os, asyncio, pathlib, logging, io
+from datetime import datetime, timezone, timedelta
+import websockets
+from telegram import (
+    Update, ReplyKeyboardMarkup, KeyboardButton,
+    BotCommand, InputFile
+)
+from telegram.ext import (
+    Application, ContextTypes, CommandHandler,
+    MessageHandler, filters
+)
+
+# ─── настройки ─────────────────────────────────────────────────────────────
+TOKEN      = os.getenv("SCANNER_BOT_TOKEN")
+WS_HOST    = "0.0.0.0"
+WS_PORT    = 8765
+IMAGES_DIR = pathlib.Path("scans/images")
+TIMEOUT    = 15
+MSK        = timezone(timedelta(hours=3))
+
+# ─── логирование ───────────────────────────────────────────────────────────
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+logging.getLogger("telegram.ext").setLevel(logging.DEBUG)
+log = logging.getLogger("scanner")
+
+# ─── WebSocket ─────────────────────────────────────────────────────────────
+ws_client: websockets.WebSocketServerProtocol | None = None
+img_queue: asyncio.Queue[bytes] = asyncio.Queue()
+
+async def ws_handler(ws: websockets.WebSocketServerProtocol):
+    global ws_client
+    ws_client = ws
+    log.info("Flutter подключён")
+    try:
+        async for msg in ws:
+            if isinstance(msg, bytes):
+                await img_queue.put(msg)
+            else:
+                log.debug("WS text: %s", msg)
+    finally:
+        if ws_client is ws:
+            ws_client = None
+            log.info("Flutter отключён")
+
+async def send_scan_cmd():
+    """Отправляем {'cmd':'scan'} текущему клиенту, если соединение живо."""
+    global ws_client
+    if not ws_client:                       # клиент ещё не подключён
+        log.warning("Нет подключённого клиента WebSocket")
+        return
+    try:
+        await ws_client.send('{"cmd":"scan"}')
+        log.info("SCAN cmd sent to WS")
+    except Exception as e:                  # соединение закрыто или другая ошибка
+        log.warning("Не удалось отправить WS-команду: %s", e)
+        ws_client = None                    # забываем клиент
+
+
+# ─── утилиты ───────────────────────────────────────────────────────────────
+def make_fname() -> str:
+    return f"{int(datetime.now(MSK).timestamp() * 1000)}.png"
+
+def ensure_dirs():
+    IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+
+# ─── Telegram-обработчики ──────────────────────────────────────────────────
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    kb = ReplyKeyboardMarkup([[KeyboardButton("📷 Скан")]], resize_keyboard=True)
+    await update.message.reply_text(
+        "Привет! Нажми «📷 Скан» или /scan, чтобы сделать снимок.",
+        reply_markup=kb
+    )
+
+async def do_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    log.info("SCAN requested by chat %s", update.effective_chat.id)
+    note = await update.message.reply_text(f"📸 Ожидаем файл… (≤ {TIMEOUT}s)")
+    await send_scan_cmd()
+
+    try:
+        img_bytes = await asyncio.wait_for(img_queue.get(), timeout=TIMEOUT)
+    except asyncio.TimeoutError:
+        await note.edit_text("⚠️ Фото не пришло. Проверь соединение клиента.")
+        return
+
+    fname = make_fname()
+    ensure_dirs()
+    (IMAGES_DIR / fname).write_bytes(img_bytes)
+
+    await ctx.bot.send_photo(
+        chat_id=update.effective_chat.id,
+        photo=InputFile(io.BytesIO(img_bytes), filename=fname),
+        caption=f"Скан сохранён: `{fname}`",
+        parse_mode="Markdown"
+    )
+    await note.delete()
+
+async def unknown(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Неизвестная команда.")
+
+# ─── запуск ────────────────────────────────────────────────────────────────
+async def main():
+    if not TOKEN:
+        raise RuntimeError("SCANNER_BOT_TOKEN не задан")
+
+    ensure_dirs()
+
+    ws_srv = await websockets.serve(ws_handler, WS_HOST, WS_PORT)
+    log.info("WS listening on ws://%s:%d", WS_HOST, WS_PORT)
+
+    app = Application.builder().token(TOKEN).build()
+    await app.bot.set_my_commands([BotCommand("scan", "сделать фото")])
+
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("scan", do_scan))
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"(?i)скан"), do_scan))
+    app.add_handler(MessageHandler(filters.COMMAND, unknown))
+
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling()      # ← добавлен await
+    log.info("Bot polling… (Ctrl-C для остановки)")
+
+    try:
+        await asyncio.Event().wait()       # держим процесс живым
+    finally:
+        await app.updater.stop()
+        await app.stop()
+        await app.shutdown()
+        ws_srv.close()
+        await ws_srv.wait_closed()
+
+if __name__ == "__main__":
+    asyncio.run(main())

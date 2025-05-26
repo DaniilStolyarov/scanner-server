@@ -1,0 +1,155 @@
+// lib/main.dart
+import 'dart:async';
+import 'dart:convert';
+import 'dart:typed_data';
+import 'dart:io' show WebSocket;           // ← для ручного подключения
+import 'package:flutter/material.dart';
+import 'package:camera/camera.dart';
+import 'package:web_socket_channel/io.dart';
+
+/// ── НАСТРОЙКИ ────────────────────────────────────────────────────────────
+const bool   releaseEnv       = false;
+const String releaseServerIp  = 'YOUR_PUBLIC_SERVER_IP';
+const String debugServerIp    = '192.168.36.57';
+const int    wsPort           = 8765;
+const _connectTimeout         = Duration(seconds: 2);
+const _reconnectDelay         = Duration(seconds: 2);
+
+String get _serverIp => releaseEnv ? releaseServerIp : debugServerIp;
+String get _wsUrl    => 'ws://$_serverIp:$wsPort';
+
+late final List<CameraDescription> _cams;
+
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  _cams = await availableCameras();
+  runApp(const ScanCamApp());
+}
+
+/// ─── приложение ─────────────────────────────────────────────────────────
+class ScanCamApp extends StatelessWidget {
+  const ScanCamApp({super.key});
+  @override
+  Widget build(BuildContext context) =>
+      const MaterialApp(debugShowCheckedModeBanner: false, home: ScanScreen());
+}
+
+/// ─── основной экран ─────────────────────────────────────────────────────
+class ScanScreen extends StatefulWidget {
+  const ScanScreen({super.key});
+  @override
+  State<ScanScreen> createState() => _ScanScreenState();
+}
+
+class _ScanScreenState extends State<ScanScreen> {
+  late final CameraController _cam;
+
+  IOWebSocketChannel? _ws;
+  StreamSubscription?  _wsSub;
+
+  bool _ready = false, _scanning = false, _connected = false;
+
+  /* ─────────── lifecycle ─────────────────────────────────────────────── */
+  @override
+  void initState() { super.initState(); _init(); }
+
+  Future<void> _init() async {
+    _cam = CameraController(_cams.first, ResolutionPreset.high,
+        enableAudio: false);
+    await _cam.initialize();
+    _openWs();
+    setState(() => _ready = true);
+  }
+
+  @override
+  void dispose() {
+    _wsSub?.cancel();
+    _ws?.sink.close();
+    _cam.dispose();
+    super.dispose();
+  }
+
+  /* ─────────── WebSocket ─────────────────────────────────────────────── */
+  Future<void> _openWs() async {
+    _setConn(false);
+    _wsSub?.cancel();
+
+    try {
+      final sock = await WebSocket.connect(_wsUrl)
+          .timeout(_connectTimeout);             // hand-shake
+      _ws   = IOWebSocketChannel(sock);
+      _setConn(true);
+
+      _wsSub = _ws!.stream.listen(
+        _onWsData,
+        onDone:  () => _handleClose(),
+        onError: (_) => _handleClose(),
+      );
+    } catch (_) {
+      _handleClose();                            // не подключились
+    }
+  }
+
+  void _handleClose() {
+    _wsSub?.cancel();
+    _setConn(false);
+    if (mounted) Future.delayed(_reconnectDelay, _openWs);
+  }
+
+  void _setConn(bool v) {
+    if (mounted && _connected != v) {
+      setState(() => _connected = v);
+    }
+  }
+
+  /* ─────────── входящие сообщения ────────────────────────────────────── */
+  void _onWsData(dynamic msg) async {
+    if (msg is! String) return;
+    final data = jsonDecode(msg);
+    if (data is! Map || data['cmd'] != 'scan' || _scanning) return;
+
+    _scanning = true;
+    await _takeAndSend();
+    _scanning = false;
+  }
+
+  Future<void> _takeAndSend() async {
+    final file  = await _cam.takePicture();
+    final bytes = await file.readAsBytes();
+    _ws?.sink.add(bytes);
+  }
+
+  /* ─────────── UI ────────────────────────────────────────────────────── */
+  @override
+  Widget build(BuildContext context) {
+    if (!_ready) {
+      return const Scaffold(
+        backgroundColor: Colors.black,
+        body: Center(child: CircularProgressIndicator(color: Colors.white)),
+      );
+    }
+
+    final size   = _cam.value.previewSize!;
+    final aspect = size.height / size.width;
+
+    return Scaffold(
+      backgroundColor: Colors.black,
+      body: Stack(
+        alignment: Alignment.bottomRight,
+        children: [
+          Center(
+            child: AspectRatio(aspectRatio: aspect, child: CameraPreview(_cam)),
+          ),
+          Padding(
+            padding: const EdgeInsets.all(16),
+            child: Icon(
+              _connected ? Icons.check_circle : Icons.cancel,
+              color: _connected ? Colors.green : Colors.red,
+              size: 32,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
