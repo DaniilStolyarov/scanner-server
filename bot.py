@@ -39,6 +39,7 @@ class ScannerBot:
         self._ws:   websockets.WebSocketServerProtocol | None = None
         self._img_q: asyncio.Queue[bytes] = asyncio.Queue()
         self._last_file: pathlib.Path | None = None     # description file
+        self._last_stem: str | None = None   # добавьте в __init__
 
     # ────────────────── публичный запуск ────────────────────────────────
     async def run(self):
@@ -139,6 +140,7 @@ class ScannerBot:
         des_path = self.cfg.DIR_DES / f"{ts}.txt"
         img_path.write_bytes(img)
         des_path.touch()
+        self._last_stem = str(ts)            # сразу после touch()
         self._last_file = des_path
         return img_path, des_path
 
@@ -167,7 +169,28 @@ class ScannerBot:
         ah(CommandHandler("scan",  self._cmd_scan))
         ah(MessageHandler(filters.Regex("(?i)скан"), self._cmd_scan))
         ah(MessageHandler(filters.TEXT & ~filters.COMMAND, self._plain_text))
+        ah(MessageHandler(filters.PHOTO, self._photo))
         ah(MessageHandler(filters.COMMAND, self._cmd_unknown))
+
+    async def _photo(self, u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        """
+        Если пользователь присылает изображение —
+        сохраняем его как scans/descriptions/<last_stem>.png
+        с перезаписью.
+        """
+        if not self._last_stem:
+            await u.message.reply_text("❔ Нет последнего скана, к которому привязать изображение.")
+            return
+
+        # берём самое большое фото из Telegram
+        photo = max(u.message.photo, key=lambda p: p.width * p.height)
+        file  = await ctx.bot.get_file(photo.file_id)
+        data  = await file.download_as_bytearray()
+
+        img_path = self.cfg.DIR_DES / f"{self._last_stem}.png"
+        img_path.write_bytes(data)          # перезаписываем
+
+        await u.message.reply_text(f"🖼️ Фото сохранено как `{img_path.name}`", parse_mode="Markdown")
 
 # ───────────── entrypoint ────────────────────────────────────────────────
 if __name__ == "__main__":
